@@ -17,35 +17,47 @@
 <main>
   <div class="intro">
     <div><p class="eyebrow">LIFE UNDERGROUND <span>/</span> LEVELS 12–14</p><h1 id="page-title">Deep-level response</h1><p class="lede" id="page-description">Coordinate cooling, safe passage, and mobile care across the deep levels.</p></div>
-    <span class="chip sim"><span aria-hidden="true">◉</span> Live simulation</span>
+    <span class="chip sim" id="sim-clock" role="status"><span aria-hidden="true">◉</span> Simulated</span>
   </div>
   <section id="dispatcher" aria-label="Dispatcher console">
     <div class="metrics">
       <article><span>! &nbsp; Symptom reports</span><strong id="total-reports">—</strong><small>Last 6 hours · self-reported</small></article>
       <article><span>✚ &nbsp; Needs help moving</span><strong id="total-help">—</strong><small>Across all five sectors</small></article>
-      <article><span>ϟ &nbsp; Backup power</span><strong>1 <em>refuge</em></strong><small>Cooling and mobile clinic</small></article>
+      <article><span>≈ &nbsp; East corridor closes in</span><strong id="flood-metric">—</strong><small id="flood-sub"></small></article>
     </div>
     <div class="grid">
       <section class="panel map-panel" aria-labelledby="map-title">
         <div class="panel-head"><div><p class="eyebrow">TUNNEL NETWORK</p><h2 id="map-title">Sector map</h2></div><label class="toggle"><input type="checkbox" id="dispatch-access" checked> Step-free route</label></div>
         <div id="map" aria-label="Sector map with selectable sectors"></div>
-        <div class="map-key"><span>━ Step-free</span><span>┄ Stairs</span><span>× Closed</span></div>
+        <div class="map-key"><span>━ Step-free</span><span>┄ Stairs</span><span>× Closed / at risk</span></div>
         <div id="sector-detail" aria-live="polite"></div>
       </section>
       <div class="right">
         <section class="panel dispatch-panel" aria-labelledby="dispatch-title">
           <p class="eyebrow">MOBILE CARE &amp; COOLING</p><h2 id="dispatch-title">Dispatch recommendation</h2>
           <div id="recommendation" aria-live="polite"></div>
+          <div class="supplies">
+            <p class="eyebrow">CLINIC DEPOT SUPPLIES</p>
+            <div id="supplies"></div>
+            <p class="muted" id="pack-status" role="status">The clinic team chooses what to bring.</p>
+          </div>
         </section>
         <section class="panel incident" aria-labelledby="incident-title">
-          <p class="eyebrow">SIMULATION CONTROLS</p><h2 id="incident-title">Flood response drill</h2>
-          <p id="incident-copy"></p><button class="primary" id="incident-button"></button>
+          <p class="eyebrow">FLOOD FORECAST</p><h2 id="incident-title">East corridor</h2>
+          <pre class="forecast" id="forecast"></pre>
+          <p id="incident-copy"></p>
+          <div class="buttons"><button class="primary" id="incident-button">Close corridor now</button><button class="secondary" id="pause-button">Pause</button><button class="secondary" id="restart-button">Restart</button></div>
         </section>
       </div>
     </div>
     <section class="panel sector-panel" aria-labelledby="readings-title">
       <div class="panel-head"><div><p class="eyebrow">ENVIRONMENT &amp; HEALTH</p><h2 id="readings-title">Sector readings</h2></div><span class="muted" id="sample-time"></span></div>
       <div class="scroll-table"><table><thead><tr><th scope="col">Sector</th><th scope="col">Condition</th><th scope="col">Temperature</th><th scope="col">Humidity</th><th scope="col">Air quality</th><th scope="col">Water depth</th><th scope="col">Symptoms<br><small>Last 6h / prior 6h</small></th><th scope="col">Needs help moving</th></tr></thead><tbody id="readings"></tbody></table></div>
+      <p class="muted note"><small>▲ = well above this sector's normal (at least 2 standard deviations and 4 reports over its average). Counts of 1–2 show as &lt;3 so no household can be singled out.</small></p>
+    </section>
+    <section class="panel events" aria-labelledby="events-title">
+      <p class="eyebrow">WHAT THE SYSTEM NOTICED</p><h2 id="events-title">Event log</h2>
+      <ol id="events" aria-live="polite"></ol>
     </section>
   </section>
   <section id="resident" aria-label="Resident console" hidden>
@@ -75,6 +87,7 @@
             <label class="toggle"><input type="checkbox" id="needs-help"> I need help moving</label>
             <button class="secondary">Send sector report</button>
             <p class="muted" id="report-status" role="status"></p>
+            <p class="muted"><small>Your report only adds to your sector's count. Names and exact locations are never shared.</small></p>
           </form>
         </section>
       </div>

@@ -1,11 +1,29 @@
 const $ = id => document.getElementById(id);
+
+// ---- Simulation settings -------------------------------------------------
+const TICK_MS = 3000;            // real time between simulation steps
+const SIM_MIN = 10;              // simulated minutes per step
+const START_MIN = 20 * 60;       // simulated clock starts at 20:00
+const FLOOD_LIMIT = 60;          // cm of water at which the east corridor closes
+const FLOOD_BUFFER = 90;         // min: don't plan routes through a corridor forecast to close sooner
+const PUMP_FAILS_AFTER = 6;      // step after which East junction drainage stops keeping up
+const HEAT_LIMIT = { temp: 32, air: 120 };  // above either → heat / air hazard
+const COOL_SITE = { temp: 28, air: 100 };   // refuge must be at or below both
+const SMALL_COUNT = 3;           // counts 1–2 are shown as "<3" so no household can be singled out
+
+// history = symptom reports in each of the previous six 6-hour windows (the sector's normal)
 const sectors = {
-  A: { name: 'Foundry Row', level: 14, temp: 36, humidity: 78, air: 156, water: 4, reports: 24, prior: 8, help: 9, clinic: 19 },
-  B: { name: 'Clinic depot', level: 12, temp: 27, humidity: 58, air: 74, water: 1, reports: 6, prior: 5, help: 2, clinic: 4 },
-  C: { name: 'East junction', level: 14, temp: 32, humidity: 86, air: 118, water: 38, reports: 15, prior: 7, help: 6, clinic: 15 },
-  D: { name: 'Pump House', level: 14, temp: 25, humidity: 55, air: 51, water: 2, reports: 4, prior: 3, help: 1, clinic: 14, capacity: 54 },
-  E: { name: 'Spindle Hall', level: 14, temp: 26, humidity: 61, air: 61, water: 3, reports: 5, prior: 4, help: 2, clinic: 16, capacity: 40 }
+  A: { name: 'Foundry Row', level: 14, clinic: 19, help: 9, history: [6, 8, 7, 9, 8, 7] },
+  B: { name: 'Clinic depot', level: 12, clinic: 4, help: 2, history: [5, 6, 4, 5, 6, 5],
+       steady: { temp: 27, humidity: 58, air: 74, water: 1, reports: 6 } },
+  C: { name: 'East junction', level: 14, clinic: 15, help: 6, history: [6, 7, 8, 6, 7, 7] },
+  D: { name: 'Pump House', level: 14, clinic: 14, help: 1, capacity: 54, history: [3, 4, 3, 2, 3, 4],
+       steady: { temp: 25, humidity: 55, air: 51, water: 2, reports: 4 } },
+  E: { name: 'Spindle Hall', level: 14, clinic: 16, help: 2, capacity: 40, history: [4, 5, 4, 3, 5, 4],
+       steady: { temp: 26, humidity: 61, air: 61, water: 3, reports: 5 } }
 };
+const REFUGES = ['D', 'E'];   // sites with backup power
+const CLINIC = 'B';
 const tunnels = [
   { from: 'A', to: 'C', minutes: 4, name: 'Foundry ramp', style: 'ac' },
   { from: 'C', to: 'D', minutes: 3, name: 'East corridor', style: 'cd', flood: true },
@@ -13,25 +31,98 @@ const tunnels = [
   { from: 'C', to: 'E', minutes: 5, name: 'Lower ramp', style: 'ce', vertical: true },
   { from: 'B', to: 'E', minutes: 2, name: 'Clinic stairs', style: 'be', stairs: true }
 ];
-let closed = false;
+const supplies = [
+  ['Inhalers', 42], ['Oxygen concentrators', 3], ['Fever reducer doses', 160],
+  ['Oral rehydration packs', 90], ['Cooling packs', 55], ['Water purification tablets', 300]
+];
+
+let state;
 let selected = 'A';
-let tick = 0;
 let displayedAlert = '';
+let residentKey = '';
+let residentLoc = '';
 let audio;
 let flashTimer;
 
-function condition(id) {
-  if (id === 'C') return closed ? ['×', 'Corridor closed', 'danger'] : ['⚠', 'Flood risk', 'risk'];
-  if (id === 'A') return ['⚠', 'Heat + poor air', 'risk'];
-  return ['✓', 'Stable', ''];
+function reset() {
+  state = { t: 0, closed: false, closedBy: '', closedAt: '', paused: false, waterLog: [], events: [], seen: new Set(), refuge: null,
+            extra: Object.fromEntries(Object.keys(sectors).map(id => [id, { reports: 0, help: 0 }])) };
+  for (const t of [-2, -1, 0]) state.waterLog.push({ min: t * SIM_MIN, level: waterAt(t) });
+  log('Simulation started. Monitoring Levels 12–14.');
+  evaluate();
 }
 
-function sectorName(id) {
-  return `Sector ${id} · ${sectors[id].name}`;
+// ---- Scenario ------------------------------------------------------------
+const ramp = (t, start, length) => Math.max(0, Math.min(1, (t - start) / length));
+
+function waterAt(t) {
+  let level = 36;
+  for (let i = 1; i <= t; i++) level += i <= PUMP_FAILS_AFTER || level >= FLOOD_LIMIT ? 0.5 : 3;
+  return Math.min(level, 68);
 }
 
-function route(start, end, stepFree) {
-  const queue = [{ id: start, minutes: 0, path: [start], legs: [] }];
+function reading(id) {
+  const t = state.t;
+  const s = sectors[id];
+  let r;
+  if (id === 'A') {
+    const heat = ramp(t, 0, 10);
+    r = { temp: 31 + 5 * heat, humidity: 72 + 6 * heat, air: 110 + 46 * heat, water: 4, reports: 8 + Math.round(16 * ramp(t, 3, 9)) };
+  } else if (id === 'C') {
+    r = { temp: 33, humidity: 86, air: 118, water: waterAt(t), reports: 7 + Math.round(8 * ramp(t, 4, 10)) };
+  } else {
+    r = { ...s.steady };
+  }
+  return { ...r, temp: Math.round(r.temp * 10) / 10, air: Math.round(r.air),
+           reports: r.reports + state.extra[id].reports, help: s.help + state.extra[id].help };
+}
+
+// ---- Analysis ------------------------------------------------------------
+// Compare this window's reports with the sector's own normal (mean and spread of past windows).
+function baseline(id) {
+  const history = sectors[id].history;
+  const mean = history.reduce((a, b) => a + b, 0) / history.length;
+  const spread = Math.max(1, Math.sqrt(history.reduce((a, b) => a + (b - mean) ** 2, 0) / history.length));
+  const current = reading(id).reports;
+  const z = (current - mean) / spread;
+  return { mean, current, prior: history.at(-1), z, ratio: current / mean, flagged: z >= 2 && current - mean >= 4 };
+}
+
+// Flood forecast: rise rate over the last 30 simulated minutes, extrapolated to the closure limit.
+function forecast() {
+  const samples = state.waterLog.slice(-3);
+  const first = samples[0];
+  const last = samples.at(-1);
+  const window = last.min - first.min;
+  const rate = window ? (last.level - first.level) / window : 0;
+  const eta = rate > 0.001 ? Math.max(0, (FLOOD_LIMIT - last.level) / rate) : Infinity;
+  return { level: last.level, first: first.level, window, rate, eta };
+}
+
+function floodPlanningRisk() {
+  return !state.closed && forecast().eta <= FLOOD_BUFFER;
+}
+
+function hazards(id) {
+  const r = reading(id);
+  const list = [];
+  if (!route(id, CLINIC, false)) list.push(['×', 'Cut off from clinic', 'danger']);
+  if (id === 'C') {
+    const f = forecast();
+    if (state.closed) list.push(['×', 'Corridor closed', 'danger']);
+    else if (f.eta <= 180) list.push(['⚠', `Flood in ~${duration(f.eta)}`, 'risk']);
+    else if (f.rate > 0.01) list.push(['≈', 'Water rising slowly', '']);
+  }
+  if (r.temp >= HEAT_LIMIT.temp || r.air >= HEAT_LIMIT.air) list.push(['⚠', 'Heat + poor air', 'risk']);
+  const b = baseline(id);
+  if (b.flagged) list.push(['!', `Symptoms ${b.ratio.toFixed(1)}× normal`, 'risk']);
+  return list;
+}
+
+const urgent = id => hazards(id).filter(h => h[2]);
+
+function route(start, end, stepFree, avoidFloodRisk = false) {
+  const queue = [{ id: start, minutes: 0, legs: [] }];
   const visited = new Set();
   while (queue.length) {
     queue.sort((a, b) => a.minutes - b.minutes);
@@ -40,31 +131,110 @@ function route(start, end, stepFree) {
     if (next.id === end) return next;
     visited.add(next.id);
     for (const tunnel of tunnels) {
-      if ((tunnel.flood && closed) || (stepFree && tunnel.stairs)) continue;
+      if (tunnel.flood && (state.closed || avoidFloodRisk)) continue;
+      if (stepFree && tunnel.stairs) continue;
       const id = tunnel.from === next.id ? tunnel.to : tunnel.to === next.id ? tunnel.from : null;
-      if (id && !visited.has(id)) {
-        queue.push({ id, minutes: next.minutes + tunnel.minutes, path: [...next.path, id], legs: [...next.legs, tunnel.name] });
-      }
+      if (id && !visited.has(id)) queue.push({ id, minutes: next.minutes + tunnel.minutes, legs: [...next.legs, tunnel.name] });
     }
   }
   return null;
 }
 
-function allocations(stepFree) {
-  return ['D', 'E'].map(id => {
-    const clinicRoute = route('B', id, stepFree);
-    const areas = Object.entries(sectors).filter(([area, sector]) =>
-      sector.reports > sector.prior && sector.clinic >= 12 && route(area, id, true));
-    const reports = areas.reduce((total, [, sector]) => total + sector.reports, 0);
-    const help = areas.reduce((total, [, sector]) => total + sector.help, 0);
-    return { id, clinicRoute, reports, help, coverage: clinicRoute ? Math.min(sectors[id].capacity, reports) : 0 };
-  }).sort((a, b) => b.coverage - a.coverage || b.help - a.help || (a.clinicRoute?.minutes ?? Infinity) - (b.clinicRoute?.minutes ?? Infinity));
+// Pick the cooling refuge + mobile clinic site.
+function refuges(stepFree) {
+  const avoid = floodPlanningRisk();
+  const f = forecast();
+  const needy = Object.keys(sectors).filter(id => urgent(id).length);
+  return REFUGES.map(id => {
+    const r = reading(id);
+    const clinicRoute = route(CLINIC, id, stepFree, avoid);
+    const cool = r.temp <= COOL_SITE.temp && r.air <= COOL_SITE.air;
+    const served = needy.filter(s => route(s, id, true, avoid));
+    const reports = served.reduce((n, s) => n + reading(s).reports, 0);
+    const help = served.reduce((n, s) => n + reading(s).help, 0);
+    let reason = '';
+    if (!clinicRoute) {
+      reason = !route(CLINIC, id, stepFree)
+        ? (state.closed ? 'Route closed' : 'No step-free route')
+        : `Skipped · corridor floods in ~${duration(f.eta)}`;
+    } else if (!cool) reason = 'Too hot for a refuge';
+    const eligible = !reason;
+    return { id, r, clinicRoute, served, reports, help, eligible, reason,
+             coverage: eligible ? Math.min(sectors[id].capacity, reports + help) : 0 };
+  }).sort((a, b) => b.eligible - a.eligible || b.coverage - a.coverage || a.r.temp - b.r.temp ||
+    (a.clinicRoute?.minutes ?? Infinity) - (b.clinicRoute?.minutes ?? Infinity));
 }
 
-function routeText(trip) {
-  if (!trip.legs.length) return 'You are already here.';
-  return `${trip.legs.join(' → ')} · ${trip.minutes} min`;
+function priority() {
+  return Object.keys(sectors)
+    .filter(id => urgent(id).length && id !== CLINIC)
+    .map(id => ({ id, b: baseline(id) }))
+    .sort((a, b) => b.b.flagged - a.b.flagged || b.b.z - a.b.z)[0];
 }
+
+// ---- Events --------------------------------------------------------------
+function clock(t = state.t) {
+  const m = START_MIN + t * SIM_MIN;
+  return `${String(Math.floor(m / 60) % 24).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
+}
+
+function duration(min) {
+  if (!isFinite(min)) return '—';
+  const m = Math.round(min);
+  return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`;
+}
+
+function log(text) {
+  state.events.push({ time: clock(), text });
+}
+
+function once(key, condition, text) {
+  if (condition && !state.seen.has(key)) {
+    state.seen.add(key);
+    log(text);
+  }
+}
+
+function evaluate() {
+  const f = forecast();
+  for (const id of Object.keys(sectors)) {
+    const r = reading(id);
+    const b = baseline(id);
+    once('heat' + id, r.temp >= HEAT_LIMIT.temp || r.air >= HEAT_LIMIT.air,
+      `Sector ${id} over heat/air limits (${r.temp} °C, AQI ${r.air}).`);
+    once('spike' + id, b.flagged,
+      `Sector ${id}: ${b.current} symptom reports in 6h vs a normal of ${b.mean.toFixed(1)}. Flagged for the care team to investigate.`);
+  }
+  once('fast', f.rate >= 0.2, `East junction water rising ${f.rate.toFixed(2)} cm/min. Drainage is no longer keeping up.`);
+  once('buffer', floodPlanningRisk(), `Forecast: east corridor closes in ~${duration(f.eta)}. Refuge planning now avoids it.`);
+  const best = refuges(true)[0];
+  const site = best.eligible ? best.id : null;
+  if (state.refuge !== null && site !== state.refuge) {
+    log(site ? `Cooling refuge + mobile clinic moved to Sector ${site} · ${sectors[site].name}.` : 'No eligible refuge site. Dispatch teams directly.');
+  }
+  state.refuge = site;
+}
+
+function step() {
+  state.t++;
+  state.waterLog = [...state.waterLog, { min: state.t * SIM_MIN, level: waterAt(state.t) }].slice(-6);
+  if (!state.closed && waterAt(state.t) >= FLOOD_LIMIT) closeCorridor('water sensor');
+  evaluate();
+  render();
+}
+
+function closeCorridor(by) {
+  state.closed = true;
+  state.closedBy = by;
+  state.closedAt = clock();
+  log(`East corridor closed (${by}). Pump House is cut off from the clinic.`);
+}
+
+// ---- Rendering -----------------------------------------------------------
+const count = n => (n > 0 && n < SMALL_COUNT ? '<3' : String(n));
+const sectorName = id => `Sector ${id} · ${sectors[id].name}`;
+const conditions = id => (hazards(id).length ? hazards(id) : [['✓', 'Stable', '']]);
+const routeText = trip => (trip.legs.length ? `${trip.legs.join(' → ')} · ${trip.minutes} min` : 'You are already here.');
 
 function renderMap() {
   const map = $('map');
@@ -77,73 +247,142 @@ function renderMap() {
   }
   for (const button of map.querySelectorAll('[data-sector]')) {
     const id = button.dataset.sector;
-    const [icon, label, tone] = condition(id);
     button.setAttribute('aria-pressed', String(id === selected));
-    button.innerHTML = `<strong>Sector ${id}</strong><small>Level ${sectors[id].level}</small><span class="${tone}"><span aria-hidden="true">${icon}</span> ${label}</span>`;
+    button.innerHTML = `<strong>Sector ${id}</strong><small>Level ${sectors[id].level}</small>` +
+      conditions(id).slice(0, 2).map(([icon, label, tone]) => `<span class="${tone}"><span aria-hidden="true">${icon}</span> ${label}</span>`).join('');
   }
+  const risky = floodPlanningRisk();
   for (const tunnel of tunnels) {
     const edge = $('edge-' + tunnel.style);
-    const blocked = tunnel.flood && closed;
-    edge.classList.toggle('closed', blocked);
-    const status = blocked ? 'Closed' : tunnel.stairs ? 'Stairs' : 'Step-free';
+    const blocked = tunnel.flood && state.closed;
+    const atRisk = tunnel.flood && risky;
+    edge.classList.toggle('closed', blocked || atRisk);
+    const status = blocked ? 'Closed' : atRisk ? 'Flood risk' : tunnel.stairs ? 'Stairs' : 'Step-free';
+    const visible = blocked ? '× Closed' : atRisk ? '⚠ Risk' : tunnel.stairs ? 'Stairs' : '';
     edge.title = `${tunnel.name}, Sector ${tunnel.from} to Sector ${tunnel.to}. ${status}.`;
-    edge.textContent = blocked ? '× Closed' : tunnel.stairs ? 'Stairs' : '';
+    edge.innerHTML = `<span aria-hidden="true">${visible}</span><span class="sr-only">${edge.title}</span>`;
   }
-  const sector = sectors[selected];
-  $('sector-detail').innerHTML = `<h3>${sectorName(selected)}</h3><p class="sector-meta">${sector.reports} symptom reports in 6h · ${sector.help} need help moving · ${sector.clinic} min to regular clinic</p>`;
+  const r = reading(selected);
+  const b = baseline(selected);
+  $('sector-detail').innerHTML = `<h3>${sectorName(selected)}</h3><p class="sector-meta">${count(r.reports)} symptom reports in 6h (normal ≈ ${b.mean.toFixed(1)}) · ${count(r.help)} need help moving · ${sectors[selected].clinic} min to regular clinic</p>`;
 }
 
 function renderReadings() {
-  $('sample-time').textContent = 'Sample ' + (tick + 1) + ' · updates every 5s';
+  $('sample-time').textContent = `Updated ${clock()} · 1 step = ${SIM_MIN} simulated min`;
   $('readings').innerHTML = Object.entries(sectors).map(([id, sector], index) => {
-    const [icon, label, tone] = condition(id);
-    const drift = (tick + index) % 3 - 1;
-    const water = id === 'C' ? closed ? 54 + tick % 3 : sector.water + Math.min(tick, 6) : sector.water;
-    return `<tr><th scope="row">L${sector.level} · ${id} · ${sector.name}</th><td class="${tone}"><span aria-hidden="true">${icon}</span> ${label}</td><td>${sector.temp + drift} °C</td><td>${sector.humidity + drift}%</td><td>AQI ${sector.air + drift * 2}</td><td>${water} cm</td><td>${sector.reports} / ${sector.prior}</td><td>${sector.help}</td></tr>`;
+    const r = reading(id);
+    const b = baseline(id);
+    const drift = ((state.t + index) % 3 - 1) * 0.3;   // sensor noise, display only
+    const cond = conditions(id).map(([icon, label, tone]) => `<span class="${tone}"><span aria-hidden="true">${icon}</span> ${label}</span>`).join('<br>');
+    return `<tr><th scope="row">L${sector.level} · ${id} · ${sector.name}</th><td>${cond}</td><td>${(r.temp + drift).toFixed(1)} °C</td><td>${Math.round(r.humidity + drift * 3)}%</td><td>AQI ${Math.round(r.air + drift * 6)}</td><td>${r.water.toFixed(1)} cm</td><td>${count(r.reports)} / ${count(b.prior)}${b.flagged ? ' <span class="risk">▲</span>' : ''}</td><td>${count(r.help)}</td></tr>`;
   }).join('');
 }
 
 function renderDispatch() {
-  $('total-reports').textContent = Object.values(sectors).reduce((sum, sector) => sum + sector.reports, 0);
-  $('total-help').textContent = Object.values(sectors).reduce((sum, sector) => sum + sector.help, 0);
-  const options = allocations($('dispatch-access').checked);
+  const all = Object.keys(sectors).map(reading);
+  $('total-reports').textContent = all.reduce((sum, r) => sum + r.reports, 0);
+  $('total-help').textContent = all.reduce((sum, r) => sum + r.help, 0);
+  const f = forecast();
+  $('flood-metric').innerHTML = state.closed ? '<span class="danger">Closed</span>' : isFinite(f.eta) ? `~${duration(f.eta)}` : 'Stable';
+  $('flood-sub').textContent = `Water ${f.level.toFixed(1)} cm · closes at ${FLOOD_LIMIT} cm`;
+
+  const top = priority();
+  let priorityHtml = '<p class="dispatch-site">No sector needs priority</p><p class="muted">All sectors are within normal ranges.</p>';
+  if (top) {
+    const r = reading(top.id);
+    const why = top.b.flagged
+      ? `${top.b.current} symptom reports in the last 6 hours, up from ${count(top.b.prior)} (normal ≈ ${top.b.mean.toFixed(1)}). Worth investigating: reports are self-submitted, not diagnoses.`
+      : `${urgent(top.id).map(h => h[1]).join(', ')} · ${r.temp} °C, AQI ${r.air}.`;
+    priorityHtml = `<p class="dispatch-site">Prioritize Level ${sectors[top.id].level} · ${sectorName(top.id)}</p><p class="muted">${why}</p>`;
+  }
+
+  const options = refuges($('dispatch-access').checked);
   const best = options[0];
+  const refugeHtml = best.eligible
+    ? `<p class="dispatch-site">Set up in ${sectorName(best.id)}</p>
+       <p class="muted">Coolest eligible site (${best.r.temp} °C, AQI ${best.r.air}) with backup power. Step-free from ${best.served.length ? (best.served.length > 1 ? 'Sectors ' : 'Sector ') + best.served.join(', ') : 'no hazard sectors'}: ${count(best.reports)} recent symptom reports, ${count(best.help)} need help moving. Room for ${sectors[best.id].capacity}.${best.reports + best.help > sectors[best.id].capacity ? ` <span class="risk">Demand may exceed space by ~${best.reports + best.help - sectors[best.id].capacity}: plan an overflow site.</span>` : ''}</p>
+       <p class="route">From clinic depot · ${routeText(best.clinicRoute)}</p>`
+    : '<p class="dispatch-site">No eligible refuge</p><p class="muted">Every powered site is cut off or too hot. Send teams directly to the priority sector.</p>';
+
   $('recommendation').innerHTML = `
-    <span class="chip"><span aria-hidden="true">ϟ</span> Power and mobile clinic</span>
-    <p class="dispatch-site">${sectorName(best.id)}</p>
-    <p class="muted">A step-free route reaches this refuge from sectors with ${best.reports} recent symptom reports and ${best.help} requests for help moving. The refuge has ${sectors[best.id].capacity} spaces.</p>
-    <p class="route">From clinic depot · ${routeText(best.clinicRoute)}</p>
+    <div class="priority"><span class="chip risk"><span aria-hidden="true">!</span> Priority sector</span>${priorityHtml}</div>
+    <span class="chip"><span aria-hidden="true">ϟ</span> Cooling refuge + mobile clinic</span>${refugeHtml}
     <div class="allocation">
-      ${options.map(option => `<div><span>${sectors[option.id].name}</span><strong>${option.clinicRoute ? option.coverage + ' priority places' : '× Route closed'}</strong></div>`).join('')}
-      <p class="muted"><small>Priority goes to the site with room for the most reports from step-free sectors with rising symptoms and a longer trip to regular care. Help requests break ties.</small></p>
+      ${options.map(o => `<div><span>${sectors[o.id].name}</span><strong class="${o.eligible ? '' : 'danger'}">${o.eligible ? (o.id === best.id ? '✓ Selected' : 'Backup') : '× ' + o.reason}</strong></div>`).join('')}
+      <p class="muted"><small>Refuge rule: has backup power, ≤ ${COOL_SITE.temp} °C and AQI ≤ ${COOL_SITE.air}, reachable from the clinic without a corridor forecast to flood within ${FLOOD_BUFFER} min. Then most people served, then coolest.</small></p>
     </div>`;
-  $('incident-button').textContent = closed ? 'Reset flood drill' : 'Close east corridor';
-  $('incident-copy').textContent = closed
-    ? 'Water reached the closure threshold. The east corridor is blocked and Pump House is cut off.'
-    : 'Water is rising at East Junction. Close the corridor to see where the clinic and backup power move.';
-  renderMap();
-  renderReadings();
+
+  const math = state.closed
+    ? `Closed at ${state.closedAt} by ${state.closedBy}.\nWater now ${f.level.toFixed(1)} cm (limit ${FLOOD_LIMIT} cm).`
+    : `Water at East junction: ${f.level.toFixed(1)} cm (limit ${FLOOD_LIMIT} cm)\n` +
+      `Rise: ${f.first.toFixed(1)} → ${f.level.toFixed(1)} cm over ${f.window} min = ${f.rate.toFixed(2)} cm/min\n` +
+      (isFinite(f.eta) ? `At this rate: limit reached in ~${duration(f.eta)} (≈ ${clock(state.t + f.eta / SIM_MIN)})` : 'Not rising: no closure forecast');
+  $('forecast').textContent = math;
+  $('incident-copy').textContent = state.closed
+    ? 'The east corridor is blocked. Pump House can only be reached by a team on foot once the water drops.'
+    : 'The corridor closes automatically when the water sensor hits the limit. A dispatcher can close it early.';
+  $('incident-button').disabled = state.closed;
+  $('pause-button').textContent = state.paused ? 'Resume' : 'Pause';
+  $('sim-clock').innerHTML = `<span aria-hidden="true">◉</span> ${state.paused ? 'Paused' : 'Simulated'} · ${clock()}`;
 }
 
-function residentAlert(signal = false) {
-  const location = $('resident-sector').value;
-  const target = allocations(true)[0].id;
-  const trip = route(location, target, $('resident-access').checked);
-  const status = closed ? 'Flood closure' : 'Flood risk';
-  const action = !trip ? 'Request help moving.' : trip.legs.length ? `Move to Sector ${target} · ${sectors[target].name}.` : `Stay at ${sectors[target].name}.`;
-  const detail = !trip ? 'No open route to the powered refuge. Use the form to request help.' : routeText(trip);
-  const explanation = closed
-    ? 'East corridor is closed between Sectors C and D.'
-    : 'Rising water could close the east corridor in about 2 hours if the current rate holds.';
+function renderEvents() {
+  $('events').innerHTML = state.events.slice(-8).reverse()
+    .map(e => `<li><time>${e.time}</time><span>${e.text}</span></li>`).join('');
+}
+
+function explanation(loc, list) {
+  const f = forecast();
+  const r = reading(loc);
+  return list.map(([, label]) => {
+    if (label.startsWith('Cut off')) return 'The flooded east corridor is the only way out of this sector.';
+    if (label === 'Corridor closed') return 'East corridor is closed between Sectors C and D.';
+    if (label.startsWith('Flood')) return `Water is rising ${f.rate.toFixed(2)} cm/min. At this rate the east corridor closes in about ${duration(f.eta)}.`;
+    if (label.startsWith('Heat')) return `Your sector is ${r.temp} °C with air quality index ${r.air}.`;
+    return 'Symptom reports here are well above normal. A mobile clinic is being set up at the refuge.';
+  }).join(' ');
+}
+
+function residentAlert(allowSignal = true) {
+  const loc = $('resident-sector').value;
+  const best = refuges(true)[0];
+  const target = best.eligible ? best.id : null;
+  const trip = target ? route(loc, target, $('resident-access').checked) : null;
+  const list = urgent(loc);
+  let status, tone, action, detail, why;
+  if (!list.length) {
+    status = 'All clear'; tone = '';
+    action = 'No action needed.';
+    detail = trip ? `Nearest cooling refuge: ${sectorName(target)} · ${routeText(trip)}` : 'No cooling refuge reachable right now.';
+    why = 'Readings in your sector are within safe limits.';
+  } else {
+    status = list[0][1]; tone = list[0][2];
+    action = !trip ? 'Request help moving.' : trip.legs.length ? `Move to ${sectorName(target)}.` : `Stay at ${sectors[target].name}.`;
+    detail = trip ? routeText(trip) : 'No open route to the cooling refuge. Use the form to request help.';
+    why = explanation(loc, list);
+  }
   displayedAlert = `${status}. ${action} ${detail}`;
-  $('resident-alert').innerHTML = `<span class="chip ${closed ? 'danger' : 'risk'}"><span aria-hidden="true">⚠</span> ${status}</span><h2 id="alert-title">${action}</h2><p class="action-line">${detail}</p><p class="muted">${explanation}</p><button class="secondary" id="speak">Read directions aloud</button>`;
+  $('resident-alert').innerHTML = `<span class="chip ${tone}"><span aria-hidden="true">${tone ? '⚠' : '✓'}</span> ${status}</span><h2 id="alert-title">${action}</h2><p class="action-line">${detail}</p><p class="muted">${why}</p><button class="secondary" id="speak">Read directions aloud</button>`;
+  $('resident-alert').classList.toggle('clear', !tone);
   $('speak').addEventListener('click', speak);
-  if (signal) {
+  const key = `${status}|${action}|${detail}`;
+  if (allowSignal && loc === residentLoc && key !== residentKey && tone) {
     $('announcement').textContent = displayedAlert;
     void signalAlert();
   }
+  residentKey = key;
+  residentLoc = loc;
 }
 
+function render() {
+  renderDispatch();
+  renderMap();
+  renderReadings();
+  renderEvents();
+  residentAlert();
+}
+
+// ---- Alert signals -------------------------------------------------------
 function speak() {
   if (!('speechSynthesis' in window) || typeof SpeechSynthesisUtterance !== 'function') {
     $('signal-status').textContent = 'Spoken directions are unavailable in this browser.';
@@ -173,19 +412,19 @@ async function signalAlert(test = false) {
   }
   if ($('sound').checked) {
     try {
-      const Audio = window.AudioContext || window.webkitAudioContext;
-      audio ??= new Audio();
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      audio ??= new AudioCtx();
       await audio.resume();
-      for (const delay of [0, .24]) {
+      for (const delay of [0, 0.24]) {
         const tone = audio.createOscillator();
         const gain = audio.createGain();
         const start = audio.currentTime + delay;
         tone.frequency.value = 740;
-        gain.gain.value = .12;
-        gain.gain.setTargetAtTime(.001, start + .13, .015);
+        gain.gain.value = 0.12;
+        gain.gain.setTargetAtTime(0.001, start + 0.13, 0.015);
         tone.connect(gain).connect(audio.destination);
         tone.start(start);
-        tone.stop(start + .19);
+        tone.stop(start + 0.19);
       }
       results.push('Two warning beeps played');
     } catch {
@@ -195,27 +434,32 @@ async function signalAlert(test = false) {
   $('signal-status').textContent = results.length ? results.join(' · ') : test ? 'Choose an alert signal to test.' : '';
 }
 
+// ---- Wiring --------------------------------------------------------------
 function showView(resident) {
   $('resident').hidden = !resident;
   $('dispatcher').hidden = resident;
   $('resident-tab').setAttribute('aria-pressed', String(resident));
   $('dispatcher-tab').setAttribute('aria-pressed', String(!resident));
   $('page-title').textContent = resident ? 'Resident alerts' : 'Deep-level response';
-  $('page-description').textContent = resident ? 'Check your route to the powered refuge, or request help moving.' : 'Coordinate cooling, safe passage, and mobile care across the deep levels.';
-  if (resident) residentAlert();
+  $('page-description').textContent = resident ? 'Check your route to the cooling refuge, or request help moving.' : 'Coordinate cooling, safe passage, and mobile care across the deep levels.';
+  residentAlert(false);
 }
 
 $('resident-sector').innerHTML = Object.keys(sectors).map(id => `<option value="${id}">L${sectors[id].level} · ${sectorName(id)}</option>`).join('');
+$('supplies').innerHTML = supplies.map(([name, qty], i) =>
+  `<label class="toggle"><input type="checkbox" data-supply="${i}"> ${name} <span class="muted">· ${qty} available</span></label>`).join('');
+$('supplies').addEventListener('change', () => {
+  const packed = [...$('supplies').querySelectorAll('input:checked')].map(box => supplies[box.dataset.supply][0]);
+  $('pack-status').textContent = packed.length ? `Packed: ${packed.join(', ')}` : 'The clinic team chooses what to bring.';
+});
 $('resident-tab').addEventListener('click', () => showView(true));
 $('dispatcher-tab').addEventListener('click', () => showView(false));
-$('display').addEventListener('change', event => {
-  document.documentElement.dataset.display = event.target.value;
-});
+$('display').addEventListener('change', event => { document.documentElement.dataset.display = event.target.value; });
 $('dispatch-access').addEventListener('change', renderDispatch);
-$('resident-access').addEventListener('change', () => residentAlert());
+$('resident-access').addEventListener('change', () => residentAlert(false));
 $('resident-sector').addEventListener('change', () => {
   $('report-status').textContent = '';
-  residentAlert();
+  residentAlert(false);
 });
 $('map').addEventListener('click', event => {
   const node = event.target.closest('[data-sector]');
@@ -224,29 +468,35 @@ $('map').addEventListener('click', event => {
   renderMap();
 });
 $('incident-button').addEventListener('click', () => {
-  closed = !closed;
-  tick = 0;
+  closeCorridor('dispatcher');
+  evaluate();
+  render();
+});
+$('pause-button').addEventListener('click', () => {
+  state.paused = !state.paused;
   renderDispatch();
-  residentAlert(closed);
+});
+$('restart-button').addEventListener('click', () => {
+  reset();
+  residentKey = '';
+  render();
 });
 $('test-alert').addEventListener('click', () => void signalAlert(true));
 $('report-form').addEventListener('submit', event => {
   event.preventDefault();
   const id = $('resident-sector').value;
-  const sector = sectors[id];
   if (!$('symptom').value && !$('needs-help').checked) {
     $('report-status').textContent = 'Choose a symptom or request help moving.';
     return;
   }
-  if ($('symptom').value) sector.reports++;
-  if ($('needs-help').checked) sector.help++;
+  if ($('symptom').value) state.extra[id].reports++;
+  if ($('needs-help').checked) state.extra[id].help++;
   $('report-form').reset();
-  $('report-status').textContent = `Report added to the Sector ${id} totals.`;
-  renderDispatch();
+  $('report-status').textContent = `Added to the Sector ${id} totals. Only sector counts are shared.`;
+  evaluate();
+  render();
 });
-renderDispatch();
-residentAlert();
-setInterval(() => {
-  tick++;
-  if (!$('dispatcher').hidden) renderReadings();
-}, 5000);
+
+reset();
+render();
+setInterval(() => { if (!state.paused) step(); }, TICK_MS);
