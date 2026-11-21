@@ -14,6 +14,7 @@
   <nav aria-label="Console view"><button id="resident-tab" aria-pressed="false" aria-controls="resident">Resident</button><button id="dispatcher-tab" aria-pressed="true" aria-controls="dispatcher">Dispatcher</button></nav>
   <div class="display-options"><label for="display" class="sr-only">Display mode</label><select id="display"><option value="dark">Dark display</option><option value="amber">Amber night</option><option value="text">Text only</option></select></div>
 </header>
+<div id="net-banner" class="net-banner" role="status" hidden></div>
 <main>
   <div class="intro">
     <div><p class="eyebrow">LIFE UNDERGROUND <span>/</span> LEVELS 12–14</p><h1 id="page-title">Deep-level response</h1><p class="lede" id="page-description">Coordinate cooling, safe passage, and mobile care across the deep levels.</p></div>
@@ -48,11 +49,16 @@
           <p id="incident-copy"></p>
           <div class="buttons"><button class="primary" id="incident-button">Close corridor now</button><button class="secondary" id="pause-button">Pause</button><button class="secondary" id="restart-button">Restart</button></div>
         </section>
+        <section class="panel network" aria-labelledby="network-title">
+          <p class="eyebrow">COMMUNICATIONS</p><h2 id="network-title">Network</h2>
+          <p class="muted" id="network-copy"></p>
+          <button class="secondary" id="network-button">Simulate network shutdown</button>
+        </section>
       </div>
     </div>
     <section class="panel sector-panel" aria-labelledby="readings-title">
       <div class="panel-head"><div><p class="eyebrow">ENVIRONMENT &amp; HEALTH</p><h2 id="readings-title">Sector readings</h2></div><span class="muted" id="sample-time"></span></div>
-      <div class="scroll-table"><table><thead><tr><th scope="col">Sector</th><th scope="col">Condition</th><th scope="col">Temperature</th><th scope="col">Humidity</th><th scope="col">Air quality</th><th scope="col">Water depth</th><th scope="col">Symptoms<br><small>Last 6h / prior 6h</small></th><th scope="col">Needs help moving</th></tr></thead><tbody id="readings"></tbody></table></div>
+      <div class="scroll-table"><table><thead><tr><th scope="col">Sector</th><th scope="col">Condition</th><th scope="col">Temperature</th><th scope="col">Humidity</th><th scope="col">Air quality</th><th scope="col">Water depth</th><th scope="col">Symptoms<br><small>Last 6h / prior 6h</small></th><th scope="col">Needs help moving</th><th scope="col">Link to dispatch</th></tr></thead><tbody id="readings"></tbody></table></div>
       <p class="muted note"><small>▲ = well above this sector's normal (at least 2 standard deviations and 4 reports over its average). Counts of 1–2 show as &lt;3 so no household can be singled out.</small></p>
     </section>
     <section class="panel events" aria-labelledby="events-title">
@@ -69,8 +75,19 @@
         </section>
         <article class="panel resident-alert" id="resident-alert" aria-labelledby="alert-title"></article>
         <div id="announcement" class="sr-only" role="alert"></div>
+        <section class="panel today" aria-labelledby="today-title">
+          <p class="eyebrow">RIGHT NOW</p><h2 id="today-title">In your sector</h2>
+          <ul id="today"></ul>
+        </section>
       </div>
       <div class="right">
+        <section class="panel family" aria-labelledby="family-title">
+          <p class="eyebrow">FAMILY CHECK-IN</p><h2 id="family-title">Are they okay?</h2>
+          <button class="primary" id="safe-button">I'm safe</button>
+          <p class="muted" id="safe-status" role="status"></p>
+          <ul id="family" aria-live="polite"></ul>
+          <p class="muted"><small>Check-ins go only to your family group. They never appear on the dispatcher map. Works through relay when the network is down.</small></p>
+        </section>
         <section class="panel settings" aria-labelledby="settings-title">
           <p class="eyebrow">ACCESSIBILITY</p><h2 id="settings-title">Alert signals</h2>
           <label class="toggle"><input type="checkbox" id="sound"> Sound · two warning beeps</label>

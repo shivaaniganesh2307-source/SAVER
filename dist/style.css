@@ -108,3 +108,23 @@ footer{display:flex;justify-content:space-between;gap:14px;padding:18px 0;margin
 .resident-alert.clear{border-color:var(--border)}
 .chip.danger{color:var(--danger)}.chip.risk{color:var(--risk)}
 .grid{align-items:start}
+.net-banner{background:var(--danger);color:var(--bg);padding:10px max(24px,calc((100% - 1240px)/2));font-size:.92rem}
+.net-banner strong{margin-right:4px}
+.network{display:grid;gap:12px}
+.source{font:650 .75rem/1.5 var(--mono);color:var(--muted);margin-top:12px}
+.source.relay{color:var(--accent)}
+.ok{color:var(--accent)}
+.family #safe-button{width:100%;font-size:1.15rem;min-height:52px;margin-bottom:8px}
+#safe-status{font-size:.86rem;margin-bottom:10px}
+.family ul,.today ul{list-style:none;margin:0 0 10px;padding:0;display:grid;gap:0}
+.family li{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-top:1px solid var(--border)}
+.family li>div{display:grid;gap:2px;min-width:0}
+.family li small{color:var(--muted);font-size:.74rem}
+.family-status{text-align:right;justify-items:end;font-size:.88rem;font-weight:650}
+.today{margin-top:14px}
+.today h2{margin-bottom:10px}
+.today li{display:flex;gap:12px;padding:10px 0;border-top:1px solid var(--border)}
+.today li div{display:grid;gap:1px}
+.today li span:not(.today-icon){color:var(--muted);font-size:.9rem}
+.today-icon{font-size:1.15rem;width:1.4rem;text-align:center;color:var(--accent);flex:none}
+.resident-grid{align-items:start}

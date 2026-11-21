@@ -31,6 +31,12 @@ const tunnels = [
   { from: 'C', to: 'E', minutes: 5, name: 'Lower ramp', style: 'ce', vertical: true },
   { from: 'B', to: 'E', minutes: 2, name: 'Clinic stairs', style: 'be', stairs: true }
 ];
+// Demo family for the resident view. `at` = simulation step when each one sends a check-in.
+const FAMILY = [
+  { who: 'Mom', sector: 'B', at: 9, status: 'safe', note: 'At home' },
+  { who: 'Brother', sector: 'C', at: 10, status: 'safe', note: 'Moving to the cooling refuge' },
+  { who: 'Grandma', sector: 'D', at: 14, status: 'help', note: 'Needs help moving' }
+];
 const supplies = [
   ['Inhalers', 42], ['Oxygen concentrators', 3], ['Fever reducer doses', 160],
   ['Oral rehydration packs', 90], ['Cooling packs', 55], ['Water purification tablets', 300]
@@ -46,9 +52,12 @@ let flashTimer;
 
 function reset() {
   state = { t: 0, closed: false, closedBy: '', closedAt: '', paused: false, waterLog: [], events: [], seen: new Set(), refuge: null,
+            network: 'online', heard: {}, queue: [], mine: null,
+            family: FAMILY.map(member => ({ ...member, delivered: null, hops: null })),
             extra: Object.fromEntries(Object.keys(sectors).map(id => [id, { reports: 0, help: 0 }])) };
   for (const t of [-2, -1, 0]) state.waterLog.push({ min: t * SIM_MIN, level: waterAt(t) });
   log('Simulation started. Monitoring Levels 12–14.');
+  updateLinks();
   evaluate();
 }
 
@@ -75,6 +84,51 @@ function reading(id) {
   }
   return { ...r, temp: Math.round(r.temp * 10) / 10, air: Math.round(r.air),
            reports: r.reports + state.extra[id].reports, help: s.help + state.extra[id].help };
+}
+
+// ---- Network & relay -----------------------------------------------------
+// Online: the Directorate network carries everything. Shutdown: phones pass messages to phones
+// in neighbouring sectors, so a message only gets through where people can physically walk.
+const online = () => state.network === 'online';
+
+function hops(from, to) {
+  if (online()) return 0;
+  const trip = route(from, to, false);
+  return trip ? trip.legs.length : null;
+}
+
+const reachable = id => hops(id, CLINIC) !== null;
+const hopText = n => (n === 0 ? (online() ? 'network' : 'direct') : `${n} relay hop${n > 1 ? 's' : ''}`);
+
+function updateLinks() {
+  for (const id of Object.keys(sectors)) {
+    if (reachable(id)) state.heard[id] = { t: state.t, r: reading(id) };
+  }
+  const ready = state.queue.filter(q => reachable(q.id));
+  if (ready.length) {
+    for (const q of ready) {
+      if (q.report) state.extra[q.id].reports++;
+      if (q.help) state.extra[q.id].help++;
+    }
+    state.queue = state.queue.filter(q => !reachable(q.id));
+    const from = [...new Set(ready.map(q => q.id))].join(', ');
+    log(`${ready.length} queued report${ready.length > 1 ? 's' : ''} synced from Sector ${from}.`);
+  }
+  const loc = $('resident-sector').value;
+  for (const member of state.family) {
+    const h = hops(member.sector, loc);
+    if (member.at <= state.t && !member.delivered && h !== null) {
+      member.delivered = clock();
+      member.hops = h;
+    }
+  }
+  if (state.mine) {
+    for (const member of state.family) {
+      if (state.mine.pending.includes(member.who) && hops(loc, member.sector) !== null) {
+        state.mine.pending = state.mine.pending.filter(name => name !== member.who);
+      }
+    }
+  }
 }
 
 // ---- Analysis ------------------------------------------------------------
@@ -219,6 +273,7 @@ function step() {
   state.t++;
   state.waterLog = [...state.waterLog, { min: state.t * SIM_MIN, level: waterAt(state.t) }].slice(-6);
   if (!state.closed && waterAt(state.t) >= FLOOD_LIMIT) closeCorridor('water sensor');
+  updateLinks();
   evaluate();
   render();
 }
@@ -262,19 +317,24 @@ function renderMap() {
     edge.title = `${tunnel.name}, Sector ${tunnel.from} to Sector ${tunnel.to}. ${status}.`;
     edge.innerHTML = `<span aria-hidden="true">${visible}</span><span class="sr-only">${edge.title}</span>`;
   }
-  const r = reading(selected);
+  const live = reachable(selected);
+  const r = live ? reading(selected) : state.heard[selected].r;
   const b = baseline(selected);
-  $('sector-detail').innerHTML = `<h3>${sectorName(selected)}</h3><p class="sector-meta">${count(r.reports)} symptom reports in 6h (normal ≈ ${b.mean.toFixed(1)}) · ${count(r.help)} need help moving · ${sectors[selected].clinic} min to regular clinic</p>`;
+  const stale = live ? '' : ` · <span class="danger">no relay path, last heard ${clock(state.heard[selected].t)}</span>`;
+  $('sector-detail').innerHTML = `<h3>${sectorName(selected)}</h3><p class="sector-meta">${count(r.reports)} symptom reports in 6h (normal ≈ ${b.mean.toFixed(1)}) · ${count(r.help)} need help moving · ${sectors[selected].clinic} min to regular clinic${stale}</p>`;
 }
 
 function renderReadings() {
   $('sample-time').textContent = `Updated ${clock()} · 1 step = ${SIM_MIN} simulated min`;
   $('readings').innerHTML = Object.entries(sectors).map(([id, sector], index) => {
-    const r = reading(id);
+    const live = reachable(id);
+    const r = live ? reading(id) : state.heard[id].r;
+    const link = live ? (online() ? 'Network' : (hops(id, CLINIC) === 0 ? 'Relay · direct' : hopText(hops(id, CLINIC))))
+      : `<span class="danger">No path</span><br><small>last heard ${clock(state.heard[id].t)}</small>`;
     const b = baseline(id);
     const drift = ((state.t + index) % 3 - 1) * 0.3;   // sensor noise, display only
     const cond = conditions(id).map(([icon, label, tone]) => `<span class="${tone}"><span aria-hidden="true">${icon}</span> ${label}</span>`).join('<br>');
-    return `<tr><th scope="row">L${sector.level} · ${id} · ${sector.name}</th><td>${cond}</td><td>${(r.temp + drift).toFixed(1)} °C</td><td>${Math.round(r.humidity + drift * 3)}%</td><td>AQI ${Math.round(r.air + drift * 6)}</td><td>${r.water.toFixed(1)} cm</td><td>${count(r.reports)} / ${count(b.prior)}${b.flagged ? ' <span class="risk">▲</span>' : ''}</td><td>${count(r.help)}</td></tr>`;
+    return `<tr><th scope="row">L${sector.level} · ${id} · ${sector.name}</th><td>${cond}</td><td>${(r.temp + drift).toFixed(1)} °C</td><td>${Math.round(r.humidity + drift * 3)}%</td><td>AQI ${Math.round(r.air + drift * 6)}</td><td>${r.water.toFixed(1)} cm</td><td>${count(r.reports)} / ${count(b.prior)}${b.flagged ? ' <span class="risk">▲</span>' : ''}</td><td>${count(r.help)}</td><td>${link}</td></tr>`;
   }).join('');
 }
 
@@ -362,7 +422,11 @@ function residentAlert(allowSignal = true) {
     why = explanation(loc, list);
   }
   displayedAlert = `${status}. ${action} ${detail}`;
-  $('resident-alert').innerHTML = `<span class="chip ${tone}"><span aria-hidden="true">${tone ? '⚠' : '✓'}</span> ${status}</span><h2 id="alert-title">${action}</h2><p class="action-line">${detail}</p><p class="muted">${why}</p><button class="secondary" id="speak">Read directions aloud</button>`;
+  const h = hops(CLINIC, loc);
+  const source = online() ? `Via Hollow network · ${clock()}`
+    : h === null ? 'Local sensors only · no relay path to dispatch. Your phone keeps your reports until one opens.'
+    : `Via ${hopText(h)} from dispatch · ${clock()}`;
+  $('resident-alert').innerHTML = `<span class="chip ${tone}"><span aria-hidden="true">${tone ? '⚠' : '✓'}</span> ${status}</span><h2 id="alert-title">${action}</h2><p class="action-line">${detail}</p><p class="muted">${why}</p><p class="source ${online() ? '' : 'relay'}">${source}</p><button class="secondary" id="speak">Read directions aloud</button>`;
   $('resident-alert').classList.toggle('clear', !tone);
   $('speak').addEventListener('click', speak);
   const key = `${status}|${action}|${detail}`;
@@ -374,12 +438,65 @@ function residentAlert(allowSignal = true) {
   residentLoc = loc;
 }
 
+function renderNetwork() {
+  const queued = state.queue.length + state.family.filter(m => m.at <= state.t && !m.delivered).length + (state.mine?.pending.length ?? 0);
+  $('net-banner').hidden = online();
+  $('net-banner').innerHTML = `<strong><span aria-hidden="true">⚠</span> Directorate network down.</strong> Relay mode: messages hop phone to phone through the tunnels.${queued ? ` ${queued} message${queued > 1 ? 's' : ''} waiting for a path.` : ''}`;
+  $('network-button').textContent = online() ? 'Simulate network shutdown' : 'Restore network';
+  $('network-copy').textContent = online()
+    ? 'Alerts, readings and reports travel over the Directorate network, which it can shut off at any time.'
+    : `Relay mode. Each phone passes messages to phones in the next sector. ${Object.keys(sectors).filter(reachable).length} of 5 sectors can reach dispatch. Anything without a path is queued, not lost.`;
+}
+
+function renderFamily() {
+  const loc = $('resident-sector').value;
+  $('family').innerHTML = state.family.map(member => {
+    const h = hops(member.sector, loc);
+    let line;
+    if (member.delivered) {
+      const icon = member.status === 'safe' ? '✓' : '⚠';
+      line = `<span class="${member.status === 'safe' ? 'ok' : 'risk'}"><span aria-hidden="true">${icon}</span> ${member.note}</span><small>${member.delivered} · via ${hopText(member.hops)}</small>`;
+    } else if (h === null) {
+      line = `<span class="danger"><span aria-hidden="true">×</span> No word yet</span><small>No relay path to Sector ${member.sector}. Their phone will send when one opens.</small>`;
+    } else {
+      line = '<span class="muted">No check-in yet</span><small>Path open · will arrive when they send</small>';
+    }
+    return `<li><div><strong>${member.who}</strong><small>Level ${sectors[member.sector].level} · ${sectorName(member.sector)}</small></div><div class="family-status">${line}</div></li>`;
+  }).join('');
+  if (state.mine) {
+    const sent = state.family.length - state.mine.pending.length;
+    $('safe-status').textContent = `You checked in at ${state.mine.time}. Delivered to ${sent} of ${state.family.length}` +
+      (state.mine.pending.length ? `. ${state.mine.pending.join(', ')}: no path yet, retrying automatically.` : '.');
+  } else {
+    $('safe-status').textContent = 'One tap tells your family you are okay.';
+  }
+}
+
+function renderToday() {
+  const loc = $('resident-sector').value;
+  const r = reading(loc);
+  const minutesToMidnight = 24 * 60 - ((START_MIN + state.t * SIM_MIN) % (24 * 60));
+  const best = refuges(true)[0];
+  const refugeTrip = best.eligible ? route(loc, best.id, $('resident-access').checked) : null;
+  const clinicTrip = route(loc, CLINIC, $('resident-access').checked);
+  const safe = r.temp < HEAT_LIMIT.temp && r.air < HEAT_LIMIT.air;
+  $('today').innerHTML = [
+    ['◐', 'Your sector', `${r.temp} °C · AQI ${r.air} · ${safe ? 'within safe limits' : '<span class="risk">over heat/air limits</span>'}`],
+    ['≈', 'Water ration', `Resets at 00:00 · in ${duration(minutesToMidnight)}`],
+    ['ϟ', 'Cooling refuge', refugeTrip ? `${sectorName(best.id)} · open all night · ${refugeTrip.minutes} min away` : 'None reachable right now'],
+    ['✚', 'Clinic depot', clinicTrip ? `Open · ${clinicTrip.minutes ? clinicTrip.minutes + ' min away' : 'you are here'}` : '<span class="danger">No route · use the help form</span>']
+  ].map(([icon, label, value]) => `<li><span class="today-icon" aria-hidden="true">${icon}</span><div><strong>${label}</strong><span>${value}</span></div></li>`).join('');
+}
+
 function render() {
+  renderNetwork();
   renderDispatch();
   renderMap();
   renderReadings();
   renderEvents();
   residentAlert();
+  renderFamily();
+  renderToday();
 }
 
 // ---- Alert signals -------------------------------------------------------
@@ -456,10 +573,26 @@ $('resident-tab').addEventListener('click', () => showView(true));
 $('dispatcher-tab').addEventListener('click', () => showView(false));
 $('display').addEventListener('change', event => { document.documentElement.dataset.display = event.target.value; });
 $('dispatch-access').addEventListener('change', renderDispatch);
-$('resident-access').addEventListener('change', () => residentAlert(false));
+$('resident-access').addEventListener('change', () => { residentAlert(false); renderToday(); });
 $('resident-sector').addEventListener('change', () => {
   $('report-status').textContent = '';
+  updateLinks();
   residentAlert(false);
+  renderFamily();
+  renderToday();
+});
+$('network-button').addEventListener('click', () => {
+  state.network = online() ? 'shutdown' : 'online';
+  log(online() ? 'Directorate network restored. Queued messages syncing.' : 'Directorate network shut down. Switched to phone-to-phone relay.');
+  updateLinks();
+  evaluate();
+  render();
+});
+$('safe-button').addEventListener('click', () => {
+  const loc = $('resident-sector').value;
+  state.mine = { time: clock(), pending: state.family.filter(member => hops(loc, member.sector) === null).map(member => member.who) };
+  renderFamily();
+  renderNetwork();
 });
 $('map').addEventListener('click', event => {
   const node = event.target.closest('[data-sector]');
@@ -489,10 +622,18 @@ $('report-form').addEventListener('submit', event => {
     $('report-status').textContent = 'Choose a symptom or request help moving.';
     return;
   }
-  if ($('symptom').value) state.extra[id].reports++;
-  if ($('needs-help').checked) state.extra[id].help++;
+  const report = Boolean($('symptom').value);
+  const help = $('needs-help').checked;
+  const h = hops(id, CLINIC);
+  if (h === null) {
+    state.queue.push({ id, report, help });
+    $('report-status').textContent = 'No relay path to dispatch. Saved on your phone; it sends automatically when a path opens.';
+  } else {
+    if (report) state.extra[id].reports++;
+    if (help) state.extra[id].help++;
+    $('report-status').textContent = `Sent${online() ? '' : ` via ${hopText(h)}`}. Added to the Sector ${id} totals. Only sector counts are shared.`;
+  }
   $('report-form').reset();
-  $('report-status').textContent = `Added to the Sector ${id} totals. Only sector counts are shared.`;
   evaluate();
   render();
 });
